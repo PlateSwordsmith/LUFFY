@@ -1,0 +1,190 @@
+name: Temporary TODO README sync
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Update README TODO section
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re
+          import subprocess
+          from pathlib import Path
+
+          ROOT = Path('.')
+          README = ROOT / 'README.md'
+          TITLE = '### 📝 Complete TODO List'
+
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+
+          # The task scope is the main-to-dev change set. Scan every tracked
+          # Python file, but only replace README entries for changed files.
+          py_files = git('ls-files', '*.py').splitlines()
+
+          def extract_todos(path):
+              text = Path(path).read_text(encoding='utf-8')
+              entries = []
+              for line_no, line in enumerate(text.splitlines(), 1):
+                  match = re.search(r'#\s*TODO\b\s*(.*)$', line)
+                  if not match:
+                      continue
+                  message = match.group(1).strip()
+                  if message.startswith(':'):
+                      message = message[1:].strip()
+                  entries.append((line_no, message))
+              return entries
+
+          all_scanned = {path: extract_todos(path) for path in py_files}
+          print(f'Scanned {len(py_files)} Python files; '
+                f'{sum(len(v) for v in all_scanned.values())} TODO markers found.')
+
+          subprocess.run(
+              ['git', 'fetch', '--no-tags', 'origin', 'main:refs/remotes/origin/main'],
+              check=False,
+              capture_output=True,
+              text=True,
+          )
+          changed_raw = ''
+          for ref_range in ('origin/main...HEAD', 'main...HEAD', 'origin/main..HEAD', 'main..HEAD'):
+              result = subprocess.run(
+                  ['git', 'diff', '--name-only', ref_range],
+                  capture_output=True,
+                  text=True,
+              )
+              if result.returncode == 0:
+                  changed_raw = result.stdout
+                  break
+
+          changed_py = {
+              path for path in changed_raw.splitlines()
+              if path.endswith('.py') and Path(path).exists()
+          }
+          if not changed_py:
+              changed_py = {
+                  'luffy/deepscaler/utils.py',
+                  'luffy/verl/verl/protocol.py',
+              }
+          print('Changed Python files in scope:', sorted(changed_py))
+
+          readme_text = README.read_text(encoding='utf-8')
+          lines = readme_text.splitlines()
+          try:
+              title_index = lines.index(TITLE)
+          except ValueError as exc:
+              raise SystemExit(f'Required title not found: {TITLE!r}') from exc
+
+          next_heading_index = None
+          for index in range(title_index + 1, len(lines)):
+              if lines[index].startswith('## '):
+                  next_heading_index = index
+                  break
+          if next_heading_index is None:
+              raise SystemExit('Next README section heading not found')
+
+          entry_re = re.compile(
+              r'^- \[ \] \*\*(?P<path>.+?):(?P<line>\d+)\*\* - (?P<message>.*)$'
+          )
+          existing = []
+          for index in range(title_index + 1, next_heading_index):
+              line = lines[index]
+              if not line.strip():
+                  continue
+              match = entry_re.match(line)
+              if not match:
+                  raise SystemExit(f'Unrecognized TODO list line: {line!r}')
+              existing.append({
+                  'path': match.group('path'),
+                  'line': int(match.group('line')),
+                  'message': match.group('message'),
+                  'order': len(existing),
+              })
+
+          old_keys = {
+              (entry['path'], entry['line'], entry['message'])
+              for entry in existing
+          }
+
+          retained = []
+          for entry in existing:
+              if entry['path'] in changed_py:
+                  continue
+              retained.append((
+                  entry['path'], entry['line'], entry['order'], entry['message']
+              ))
+
+          replacement = []
+          for path in sorted(changed_py):
+              todos = all_scanned.get(path, extract_todos(path))
+              print(f'{path}: {len(todos)} current TODO entries')
+              for line_no, message in todos:
+                  replacement.append((path, line_no, len(replacement), message))
+
+          merged = retained + replacement
+          merged.sort(key=lambda item: (item[0], item[1], item[2]))
+          new_keys = {
+              (path, line_no, message)
+              for path, line_no, _, message in merged
+          }
+
+          removed = sorted(old_keys - new_keys)
+          added = sorted(new_keys - old_keys)
+          print(f'REMOVED {len(removed)}')
+          for item in removed:
+              print('  -', item)
+          print(f'ADDED {len(added)}')
+          for item in added:
+              print('  +', item)
+
+          rendered = [
+              f'- [ ] **{path}:{line_no}** - {message}'
+              for path, line_no, _, message in merged
+          ]
+          before_title = '\n'.join(lines[:title_index + 1])
+          from_next_heading = '\n'.join(lines[next_heading_index:])
+          new_text = (
+              before_title
+              + '\n\n'
+              + '\n'.join(rendered)
+              + '\n\n'
+              + from_next_heading
+              + '\n'
+          )
+
+          # Guard against accidental edits outside the TODO section.
+          old_prefix = '\n'.join(lines[:title_index + 1])
+          old_suffix = '\n'.join(lines[next_heading_index:])
+          new_prefix, remainder = new_text.split('\n\n', 1)
+          assert new_prefix == old_prefix
+          assert new_text.rstrip('\n').endswith(old_suffix)
+
+          README.write_text(new_text, encoding='utf-8')
+          print(f'README TODO entries: {len(existing)} -> {len(rendered)}')
+          PY
+
+      - name: Commit README update
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          if git diff --cached --quiet -- README.md; then
+            echo "README already up to date"
+          else
+            git commit -m "docs: sync complete TODO list with dev code"
+            git push origin HEAD:dev
+          fi

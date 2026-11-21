@@ -24,58 +24,51 @@ jobs:
           import subprocess
           from pathlib import Path
 
-          README = Path('README.md')
-          TITLE = '### 📝 Complete TODO List'
+          title = '### 📝 Complete TODO List'
 
           def git(*args):
               return subprocess.check_output(['git', *args], text=True).strip()
 
           py_files = git('ls-files', '*.py').splitlines()
 
-          def extract_todos(path):
+          def todos_for(path):
               text = Path(path).read_text(encoding='utf-8')
-              entries = []
-              for line_no, line in enumerate(text.splitlines(), 1):
+              result = []
+              for number, line in enumerate(text.splitlines(), 1):
                   match = re.search(r'#\s*TODO\b\s*(.*)$', line)
                   if not match:
                       continue
                   message = match.group(1).strip()
                   if message.startswith(':'):
                       message = message[1:].strip()
-                  entries.append((line_no, message))
-              return entries
+                  result.append((number, message))
+              return result
 
-          all_scanned = {path: extract_todos(path) for path in py_files}
-          print(f'Scanned {len(py_files)} Python files; '
-                f'{sum(len(v) for v in all_scanned.values())} TODO markers found.')
+          scanned = {path: todos_for(path) for path in py_files}
+          print('Python files scanned:', len(py_files),
+                'TODO markers:', sum(len(items) for items in scanned.values()))
 
-          subprocess.run(
-              ['git', 'fetch', '--no-tags', 'origin', 'main:refs/remotes/origin/main'],
-              check=False, capture_output=True, text=True,
+          changed = set()
+          diff = subprocess.run(
+              ['git', 'diff', '--name-only', 'origin/main...HEAD'],
+              capture_output=True, text=True,
           )
-          changed_raw = ''
-          for ref_range in ('origin/main...HEAD', 'main...HEAD', 'origin/main..HEAD', 'main..HEAD'):
-              result = subprocess.run(['git', 'diff', '--name-only', ref_range],
-                                      capture_output=True, text=True)
-              if result.returncode == 0:
-                  changed_raw = result.stdout
-                  break
-
-          changed_py = {
-              path for path in changed_raw.splitlines()
-              if path.endswith('.py') and Path(path).exists()
-          }
-          if not changed_py:
-              changed_py = {
+          if diff.returncode == 0:
+              changed = {
+                  path for path in diff.stdout.splitlines()
+                  if path.endswith('.py') and Path(path).exists()
+              }
+          if not changed:
+              changed = {
                   'luffy/deepscaler/utils.py',
                   'luffy/verl/verl/protocol.py',
               }
-          print('Changed Python files in scope:', sorted(changed_py))
+          print('Changed Python files:', sorted(changed))
 
-          readme_text = README.read_text(encoding='utf-8')
-          lines = readme_text.splitlines()
-          title_index = lines.index(TITLE)
-          next_heading_index = next(
+          text = Path('README.md').read_text(encoding='utf-8')
+          lines = text.splitlines()
+          title_index = lines.index(title)
+          heading_index = next(
               i for i in range(title_index + 1, len(lines))
               if lines[i].startswith('## ')
           )
@@ -83,60 +76,45 @@ jobs:
           entry_re = re.compile(
               r'^- \[ \] \*\*(?P<path>.+?):(?P<line>\d+)\*\* - (?P<message>.*)$'
           )
-          existing = []
-          for index in range(title_index + 1, next_heading_index):
+          entries = []
+          for index in range(title_index + 1, heading_index):
               line = lines[index]
               if not line.strip():
                   continue
               match = entry_re.match(line)
               if not match:
-                  raise SystemExit(f'Unrecognized TODO list line: {line!r}')
-              existing.append({
-                  'path': match.group('path'),
-                  'line': int(match.group('line')),
-                  'message': match.group('message'),
-                  'order': len(existing),
-              })
+                  raise SystemExit(f'Invalid TODO README line: {line!r}')
+              entries.append((
+                  match.group('path'),
+                  int(match.group('line')),
+                  len(entries),
+                  match.group('message'),
+              ))
 
-          old_keys = {(e['path'], e['line'], e['message']) for e in existing}
-          retained = [
-              (e['path'], e['line'], e['order'], e['message'])
-              for e in existing if e['path'] not in changed_py
-          ]
-
-          replacement = []
-          for path in sorted(changed_py):
-              todos = all_scanned.get(path, extract_todos(path))
-              print(f'{path}: {len(todos)} current TODO entries')
-              for line_no, message in todos:
-                  replacement.append((path, line_no, len(replacement), message))
-
-          merged = retained + replacement
+          merged = [entry for entry in entries if entry[0] not in changed]
+          for path in sorted(changed):
+              for number, message in scanned[path]:
+                  merged.append((path, number, len(merged), message))
           merged.sort(key=lambda item: (item[0], item[1], item[2]))
-          new_keys = {(p, n, m) for p, n, _, m in merged}
 
-          print(f'REMOVED {len(old_keys - new_keys)}')
+          old_keys = {(p, n, m) for p, n, _, m in entries}
+          new_keys = {(p, n, m) for p, n, _, m in merged}
+          print('Removed:', len(old_keys - new_keys))
           for item in sorted(old_keys - new_keys):
               print('  -', item)
-          print(f'ADDED {len(new_keys - old_keys)}')
+          print('Added:', len(new_keys - old_keys))
           for item in sorted(new_keys - old_keys):
               print('  +', item)
 
           rendered = [
-              f'- [ ] **{path}:{line_no}** - {message}'
-              for path, line_no, _, message in merged
+              f'- [ ] **{path}:{number}** - {message}'
+              for path, number, _, message in merged
           ]
-          before_title = '\n'.join(lines[:title_index + 1])
-          from_next_heading = '\n'.join(lines[next_heading_index:])
-          new_text = (
-              before_title + '\n\n' + '\n'.join(rendered) + '\n\n'
-              + from_next_heading + '\n'
-          )
-          assert new_text.startswith(before_title + '\n\n')
-          assert new_text.rstrip('\n').endswith(from_next_heading)
-
-          README.write_text(new_text, encoding='utf-8')
-          print(f'README TODO entries: {len(existing)} -> {len(rendered)}')
+          prefix = '\n'.join(lines[:title_index + 1])
+          suffix = '\n'.join(lines[heading_index:])
+          output = prefix + '\n\n' + '\n'.join(rendered) + '\n\n' + suffix + '\n'
+          Path('README.md').write_text(output, encoding='utf-8')
+          print('TODO entries:', len(entries), '->', len(rendered))
           PY
 
       - name: Commit README update
@@ -152,3 +130,8 @@ jobs:
             git commit -m "docs: sync complete TODO list with dev code"
             git push origin HEAD:dev
           fi
+
+      - name: Remove temporary branch
+        if: always()
+        shell: bash
+        run: git push origin --delete tmp/readme-sync-test || true
